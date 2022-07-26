@@ -4,6 +4,10 @@ go 1.16
 
 require (
 	github.com/aws/aws-sdk-go v1.44.46
+	github.com/aws/aws-sdk-go-v2 v1.16.7
+	github.com/aws/aws-sdk-go-v2/config v1.15.14
+	github.com/aws/aws-sdk-go-v2/service/cloudcontrol v1.10.4
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.50.0
 	github.com/fatih/color v1.9.0
 	github.com/golang/mock v1.6.0
 	github.com/gruntwork-io/go-commons v0.8.2

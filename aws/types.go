@@ -2,10 +2,14 @@ package aws
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/session"
+	"gopkg.in/yaml.v2"
 )
 
 const AwsResourceExclusionTagKey = "cloud-nuke-excluded"
@@ -14,11 +18,42 @@ type AwsAccountResources struct {
 	Resources map[string]AwsRegionResource
 }
 
+type ResourceTypeString string
+
+type ResourcesToNuke struct {
+	Targets []ResourceTypeString `yaml:"ResourcesToNuke"`
+}
+
 func (a *AwsAccountResources) GetRegion(region string) AwsRegionResource {
 	if val, ok := a.Resources[region]; ok {
 		return val
 	}
 	return AwsRegionResource{}
+}
+
+func LoadNukePlan() (*ResourcesToNuke, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	resourcesToNuke := &ResourcesToNuke{}
+	nukePlanPath := filepath.Join(cwd, "nuke-plan.yml")
+	f, openErr := os.Open(nukePlanPath)
+	if openErr != nil {
+		return nil, openErr
+	}
+
+	b, readErr := ioutil.ReadAll(f)
+	if readErr != nil {
+		return nil, readErr
+	}
+
+	unmarshalErr := yaml.Unmarshal(b, resourcesToNuke)
+	if unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+
+	return resourcesToNuke, nil
 }
 
 // MapResourceNameToIdentifiers converts a slice of Resources to a map of resource types to their found identifiers

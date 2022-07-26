@@ -1,8 +1,10 @@
 package externalcreds
 
 import (
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"context"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 )
 
 var externalConfig *aws.Config
@@ -11,20 +13,20 @@ func Set(opts *aws.Config) {
 	externalConfig = opts
 }
 
-func Get(region string) *session.Session {
-	config := aws.Config{
-		Region: aws.String(region),
-	}
-	// If external config was passed in, use its credentials
+func Get(region string) (aws.Config, error) {
+	// optsFuncs := []*config.LoadOptionsFunc{}
+
+	/* TODO
 	if externalConfig != nil {
-		config.Credentials = externalConfig.Credentials
-	}
-	return session.Must(
-		session.NewSessionWithOptions(
-			session.Options{
-				SharedConfigState: session.SharedConfigEnable,
-				Config:            config,
-			},
-		),
+		loadOptions.Credentials = externalConfig.Credentials
+	}*/
+
+	awsConfig, loadConfigErr := config.LoadDefaultConfig(
+		context.TODO(),
+		config.WithRegion(region),
 	)
+	if loadConfigErr != nil {
+		return aws.Config{}, loadConfigErr
+	}
+	return awsConfig, nil
 }

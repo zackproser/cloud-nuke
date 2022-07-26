@@ -1,16 +1,18 @@
 package aws
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudcontrol"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsgo "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/gruntwork-io/cloud-nuke/config"
 	"github.com/gruntwork-io/cloud-nuke/externalcreds"
 	"github.com/gruntwork-io/cloud-nuke/logging"
@@ -54,7 +56,7 @@ const (
 	defaultRegion string = "us-east-1"
 )
 
-func newSession(region string) *session.Session {
+func newConfig(region string) (aws.Config, error) {
 	return externalcreds.Get(region)
 }
 
@@ -62,8 +64,12 @@ func newSession(region string) *session.Session {
 func retryDescribeRegions() (*ec2.DescribeRegionsOutput, error) {
 	regionsToTry := append(OptInNotRequiredRegions, GovCloudRegions...)
 	for _, region := range regionsToTry {
-		svc := ec2.New(newSession(region))
-		regions, err := svc.DescribeRegions(&ec2.DescribeRegionsInput{})
+		config, loadConfigErr := newConfig(region)
+		if loadConfigErr != nil {
+			return nil, loadConfigErr
+		}
+		svc := ec2.NewFromConfig(config)
+		regions, err := svc.DescribeRegions(context.Background(), &ec2.DescribeRegionsInput{})
 		if err != nil {
 			continue
 		}
@@ -203,13 +209,8 @@ func GetTargetRegions(enabledRegions []string, selectedRegions []string, exclude
 
 // GetAllResources - Lists all aws resources
 func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTypes []string, configObj config.Config) (*AwsAccountResources, error) {
-	account := AwsAccountResources{
-		Resources: make(map[string]AwsRegionResource),
-	}
-
 	count := 1
 	totalRegions := len(targetRegions)
-	resourcesCache := map[string]map[string][]*string{}
 
 	for _, region := range targetRegions {
 		// The "global" region case is handled outside this loop
@@ -219,664 +220,41 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 
 		logging.Logger.Infof("Checking region [%d/%d]: %s", count, totalRegions, region)
 
-		cloudNukeSession := newSession(region)
-		resourcesInRegion := AwsRegionResource{}
+		awsConfig, configLoadErr := newConfig(region)
+		if configLoadErr != nil {
+			return nil, configLoadErr
+		}
 
-		// The order in which resources are nuked is important
-		// because of dependencies between resources
+		svc := cloudcontrol.NewFromConfig(awsConfig)
 
-		// ACMPCA arns
-		acmpca := ACMPCA{}
-		if IsNukeable(acmpca.ResourceName(), resourceTypes) {
-			arns, err := getAllACMPCA(cloudNukeSession, region, excludeAfter)
+		resourcesToNuke, loadErr := LoadNukePlan()
+		if loadErr != nil {
+			return nil, loadErr
+		}
+
+		for _, resourceType := range resourcesToNuke.Targets {
+
+			listInput := &cloudcontrol.ListResourcesInput{
+				TypeName: aws.String(string(resourceType)),
+			}
+
+			output, err := svc.ListResources(context.TODO(), listInput)
 			if err != nil {
-				return nil, errors.WithStackTrace(err)
+				fmt.Printf("Error listing resources: %+v\n", err)
 			}
-			if len(arns) > 0 {
-				acmpca.ARNs = awsgo.StringValueSlice(arns)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, acmpca)
-			}
-		}
-		// End ACMPCA arns
-
-		// ASG Names
-		asGroups := ASGroups{}
-		if IsNukeable(asGroups.ResourceName(), resourceTypes) {
-			groupNames, err := getAllAutoScalingGroups(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(groupNames) > 0 {
-				asGroups.GroupNames = awsgo.StringValueSlice(groupNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, asGroups)
-			}
-		}
-		// End ASG Names
-
-		// Launch Configuration Names
-		configs := LaunchConfigs{}
-		if IsNukeable(configs.ResourceName(), resourceTypes) {
-			configNames, err := getAllLaunchConfigurations(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(configNames) > 0 {
-				configs.LaunchConfigurationNames = awsgo.StringValueSlice(configNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, configs)
-			}
-		}
-		// End Launch Configuration Names
-
-		// LoadBalancer Names
-		loadBalancers := LoadBalancers{}
-		if IsNukeable(loadBalancers.ResourceName(), resourceTypes) {
-			elbNames, err := getAllElbInstances(cloudNukeSession, region, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(elbNames) > 0 {
-				loadBalancers.Names = awsgo.StringValueSlice(elbNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, loadBalancers)
-			}
-		}
-		// End LoadBalancer Names
-
-		// LoadBalancerV2 Arns
-		loadBalancersV2 := LoadBalancersV2{}
-		if IsNukeable(loadBalancersV2.ResourceName(), resourceTypes) {
-			elbv2Arns, err := getAllElbv2Instances(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(elbv2Arns) > 0 {
-				loadBalancersV2.Arns = awsgo.StringValueSlice(elbv2Arns)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, loadBalancersV2)
-			}
-		}
-		// End LoadBalancerV2 Arns
-
-		// SQS Queues
-		sqsQueue := SqsQueue{}
-		if IsNukeable(sqsQueue.ResourceName(), resourceTypes) {
-			queueUrls, err := getAllSqsQueue(cloudNukeSession, region, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(queueUrls) > 0 {
-				sqsQueue.QueueUrls = awsgo.StringValueSlice(queueUrls)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, sqsQueue)
-			}
-		}
-		// End SQS Queue
-
-		// TransitGatewayVpcAttachment
-		transitGatewayVpcAttachments := TransitGatewaysVpcAttachment{}
-		transitGatewayIsAvailable, err := tgIsAvailableInRegion(cloudNukeSession, region)
-		if err != nil {
-			return nil, errors.WithStackTrace(err)
-		}
-		if IsNukeable(transitGatewayVpcAttachments.ResourceName(), resourceTypes) && transitGatewayIsAvailable {
-			transitGatewayVpcAttachmentIds, err := getAllTransitGatewayVpcAttachments(cloudNukeSession, region, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(transitGatewayVpcAttachmentIds) > 0 {
-				transitGatewayVpcAttachments.Ids = awsgo.StringValueSlice(transitGatewayVpcAttachmentIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, transitGatewayVpcAttachments)
-			}
-		}
-		// End TransitGatewayVpcAttachment
-
-		// TransitGatewayRouteTable
-		transitGatewayRouteTables := TransitGatewaysRouteTables{}
-		if IsNukeable(transitGatewayRouteTables.ResourceName(), resourceTypes) && transitGatewayIsAvailable {
-			transitGatewayRouteTableIds, err := getAllTransitGatewayRouteTables(cloudNukeSession, region, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(transitGatewayRouteTableIds) > 0 {
-				transitGatewayRouteTables.Ids = awsgo.StringValueSlice(transitGatewayRouteTableIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, transitGatewayRouteTables)
-			}
-		}
-		// End TransitGatewayRouteTable
-
-		// TransitGateway
-		transitGateways := TransitGateways{}
-		if IsNukeable(transitGateways.ResourceName(), resourceTypes) && transitGatewayIsAvailable {
-			transitGatewayIds, err := getAllTransitGatewayInstances(cloudNukeSession, region, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(transitGatewayIds) > 0 {
-				transitGateways.Ids = awsgo.StringValueSlice(transitGatewayIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, transitGateways)
-			}
-		}
-		// End TransitGateway
-
-		// NATGateway
-		natGateways := NatGateways{}
-		if IsNukeable(natGateways.ResourceName(), resourceTypes) {
-			ngwIDs, err := getAllNatGateways(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(ngwIDs) > 0 {
-				natGateways.NatGatewayIDs = awsgo.StringValueSlice(ngwIDs)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, natGateways)
-			}
-		}
-		// End NATGateway
-
-		// OpenSearch Domains
-		domains := OpenSearchDomains{}
-		if IsNukeable(domains.ResourceName(), resourceTypes) {
-			domainNames, err := getOpenSearchDomainsToNuke(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(domainNames) > 0 {
-				domains.DomainNames = awsgo.StringValueSlice(domainNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, domains)
-			}
-		}
-		// End OpenSearchDomains
-
-		// EC2 Instances
-		ec2Instances := EC2Instances{}
-		if IsNukeable(ec2Instances.ResourceName(), resourceTypes) {
-			instanceIds, err := getAllEc2Instances(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(instanceIds) > 0 {
-				ec2Instances.InstanceIds = awsgo.StringValueSlice(instanceIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, ec2Instances)
-			}
-		}
-		// End EC2 Instances
-
-		// EBS Volumes
-		ebsVolumes := EBSVolumes{}
-		if IsNukeable(ebsVolumes.ResourceName(), resourceTypes) {
-			volumeIds, err := getAllEbsVolumes(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(volumeIds) > 0 {
-				ebsVolumes.VolumeIds = awsgo.StringValueSlice(volumeIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, ebsVolumes)
-			}
-		}
-		// End EBS Volumes
-
-		// EIP Addresses
-		eipAddresses := EIPAddresses{}
-		if IsNukeable(eipAddresses.ResourceName(), resourceTypes) {
-			allocationIds, err := getAllEIPAddresses(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(allocationIds) > 0 {
-				eipAddresses.AllocationIds = awsgo.StringValueSlice(allocationIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, eipAddresses)
-			}
-		}
-		// End EIP Addresses
-
-		// AMIs
-		amis := AMIs{}
-		if IsNukeable(amis.ResourceName(), resourceTypes) {
-			imageIds, err := getAllAMIs(cloudNukeSession, region, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(imageIds) > 0 {
-				amis.ImageIds = awsgo.StringValueSlice(imageIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, amis)
-			}
-		}
-		// End AMIs
-
-		// Snapshots
-		snapshots := Snapshots{}
-		if IsNukeable(snapshots.ResourceName(), resourceTypes) {
-			snapshotIds, err := getAllSnapshots(cloudNukeSession, region, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(snapshotIds) > 0 {
-				snapshots.SnapshotIds = awsgo.StringValueSlice(snapshotIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, snapshots)
-			}
-		}
-		// End Snapshots
-
-		// ECS resources
-		ecsServices := ECSServices{}
-		if IsNukeable(ecsServices.ResourceName(), resourceTypes) {
-			clusterArns, err := getAllEcsClusters(cloudNukeSession)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(clusterArns) > 0 {
-				serviceArns, serviceClusterMap, err := getAllEcsServices(cloudNukeSession, clusterArns, excludeAfter, configObj)
-				if err != nil {
-					return nil, errors.WithStackTrace(err)
-				}
-				ecsServices.Services = awsgo.StringValueSlice(serviceArns)
-				ecsServices.ServiceClusterMap = serviceClusterMap
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, ecsServices)
-			}
-		}
-
-		ecsClusters := ECSClusters{}
-		if IsNukeable(ecsClusters.ResourceName(), resourceTypes) {
-			ecsClusterArns, err := getAllEcsClustersOlderThan(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(ecsClusterArns) > 0 {
-				ecsClusters.ClusterArns = awsgo.StringValueSlice(ecsClusterArns)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, ecsClusters)
-			}
-		}
-		// End ECS resources
-
-		// EKS resources
-		eksClusters := EKSClusters{}
-		if IsNukeable(eksClusters.ResourceName(), resourceTypes) {
-			eksClusterNames, err := getAllEksClusters(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(eksClusterNames) > 0 {
-				eksClusters.Clusters = awsgo.StringValueSlice(eksClusterNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, eksClusters)
-			}
-		}
-		// End EKS resources
-
-		// RDS DB Instances
-		dbInstances := DBInstances{}
-		if IsNukeable(dbInstances.ResourceName(), resourceTypes) {
-			instanceNames, err := getAllRdsInstances(cloudNukeSession, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
+			for _, resourceDescription := range output.ResourceDescriptions {
+				fmt.Printf("Found resource (%s) of type: %+v\n", aws.ToString(resourceDescription.Identifier), aws.ToString(resourceDescription.Properties))
 			}
 
-			if len(instanceNames) > 0 {
-				dbInstances.InstanceNames = awsgo.StringValueSlice(instanceNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, dbInstances)
-			}
-		}
-		// End RDS DB Instances
-
-		// RDS DB Clusters
-		// These reference the Aurora Clusters, for the use it's the same resource (rds), but AWS
-		// has different abstractions for each.
-		dbClusters := DBClusters{}
-		if IsNukeable(dbClusters.ResourceName(), resourceTypes) {
-			clustersNames, err := getAllRdsClusters(cloudNukeSession, excludeAfter)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-
-			if len(clustersNames) > 0 {
-				dbClusters.InstanceNames = awsgo.StringValueSlice(clustersNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, dbClusters)
-			}
-		}
-		// End RDS DB Clusters
-
-		// Lambda Functions
-		lambdaFunctions := LambdaFunctions{}
-		if IsNukeable(lambdaFunctions.ResourceName(), resourceTypes) {
-			lambdaFunctionNames, err := getAllLambdaFunctions(cloudNukeSession, excludeAfter, configObj, lambdaFunctions.MaxBatchSize())
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-
-			if len(lambdaFunctionNames) > 0 {
-				lambdaFunctions.LambdaFunctionNames = awsgo.StringValueSlice(lambdaFunctionNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, lambdaFunctions)
-			}
-		}
-		// End Lambda Functions
-
-		// Secrets Manager Secrets
-		secretsManagerSecrets := SecretsManagerSecrets{}
-		if IsNukeable(secretsManagerSecrets.ResourceName(), resourceTypes) {
-			secrets, err := getAllSecretsManagerSecrets(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-
-			if len(secrets) > 0 {
-				secretsManagerSecrets.SecretIDs = awsgo.StringValueSlice(secrets)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, secretsManagerSecrets)
-			}
-		}
-		// End Secrets Manager Secrets
-
-		// AccessAnalyzer
-		accessAnalyzer := AccessAnalyzer{}
-		if IsNukeable(accessAnalyzer.ResourceName(), resourceTypes) {
-			analyzerNames, err := getAllAccessAnalyzers(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(analyzerNames) > 0 {
-				accessAnalyzer.AnalyzerNames = awsgo.StringValueSlice(analyzerNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, accessAnalyzer)
-			}
-		}
-		// End AccessAnalyzer
-
-		// CloudWatchDashboard
-		cloudwatchDashboards := CloudWatchDashboards{}
-		if IsNukeable(cloudwatchDashboards.ResourceName(), resourceTypes) {
-			cwdbNames, err := getAllCloudWatchDashboards(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(cwdbNames) > 0 {
-				cloudwatchDashboards.DashboardNames = awsgo.StringValueSlice(cwdbNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, cloudwatchDashboards)
-			}
-		}
-		// End CloudWatchDashboard
-
-		// CloudWatchLogGroup
-		cloudwatchLogGroups := CloudWatchLogGroups{}
-		if IsNukeable(cloudwatchLogGroups.ResourceName(), resourceTypes) {
-			lgNames, err := getAllCloudWatchLogGroups(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(lgNames) > 0 {
-				cloudwatchLogGroups.Names = awsgo.StringValueSlice(lgNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, cloudwatchLogGroups)
-			}
-		}
-		// End CloudWatchLogGroup
-
-		// S3 Buckets
-		s3Buckets := S3Buckets{}
-		if IsNukeable(s3Buckets.ResourceName(), resourceTypes) {
-			var bucketNamesPerRegion map[string][]*string
-
-			// AWS S3 buckets list operation lists all buckets irrespective of regions.
-			// For each bucket we have to make a separate call to find the bucket region.
-			// Hence for x buckets and a total of y target regions - we need to make:
-			// (x + 1) * y calls i.e. 1 call to list all x buckets, x calls to find out
-			// each bucket's region and repeat the process for each of the y regions.
-
-			// getAllS3Buckets returns a map of regions to buckets and we call it only once -
-			// thereby reducing total calls from (x + 1) * y to only (x + 1) for the first region -
-			// followed by a cache lookup for rest of the regions.
-
-			// Cache lookup to check if we already obtained bucket names per region
-			bucketNamesPerRegion, ok := resourcesCache["S3"]
-
-			if !ok {
-				bucketNamesPerRegion, err = getAllS3Buckets(cloudNukeSession, excludeAfter, targetRegions, "", s3Buckets.MaxConcurrentGetSize(), configObj)
-				if err != nil {
-					return nil, errors.WithStackTrace(err)
-				}
-
-				resourcesCache["S3"] = make(map[string][]*string)
-
-				for bucketRegion := range bucketNamesPerRegion {
-					resourcesCache["S3"][bucketRegion] = bucketNamesPerRegion[bucketRegion]
-				}
-			}
-
-			bucketNames, ok := resourcesCache["S3"][region]
-
-			if ok && len(bucketNames) > 0 {
-				s3Buckets.Names = aws.StringValueSlice(bucketNames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, s3Buckets)
-			}
-		}
-		// End S3 Buckets
-
-		DynamoDB := DynamoDB{}
-		if IsNukeable(DynamoDB.ResourceName(), resourceTypes) {
-			tablenames, err := getAllDynamoTables(cloudNukeSession, excludeAfter, configObj, DynamoDB)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-
-			if len(tablenames) > 0 {
-				DynamoDB.DynamoTableNames = awsgo.StringValueSlice(tablenames)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, DynamoDB)
-			}
-		}
-		// End Dynamo DB tables
-
-		// EC2 VPCS
-		ec2Vpcs := EC2VPCs{}
-		if IsNukeable(ec2Vpcs.ResourceName(), resourceTypes) {
-			vpcids, vpcs, err := getAllVpcs(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-
-			if len(vpcids) > 0 {
-				ec2Vpcs.VPCIds = awsgo.StringValueSlice(vpcids)
-				ec2Vpcs.VPCs = vpcs
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, ec2Vpcs)
-			}
-		}
-		// End EC2 VPCS
-
-		// Elasticaches
-		elasticaches := Elasticaches{}
-		if IsNukeable(elasticaches.ResourceName(), resourceTypes) {
-			clusterIds, err := getAllElasticacheClusters(cloudNukeSession, region, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-
-			if len(clusterIds) > 0 {
-				elasticaches.ClusterIds = awsgo.StringValueSlice(clusterIds)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, elasticaches)
-			}
-		}
-		// End Elasticaches
-
-		// KMS Customer managed keys
-		customerKeys := KmsCustomerKeys{}
-		if IsNukeable(customerKeys.ResourceName(), resourceTypes) {
-			keys, err := getAllKmsUserKeys(cloudNukeSession, customerKeys.MaxBatchSize(), excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(keys) > 0 {
-				customerKeys.KeyIds = awsgo.StringValueSlice(keys)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, customerKeys)
-			}
-
-		}
-		// End KMS Customer managed keys
-
-		// GuardDuty detectors
-		guardDutyDetectors := GuardDuty{}
-		if IsNukeable(guardDutyDetectors.ResourceName(), resourceTypes) {
-			detectors, err := getAllGuardDutyDetectors(cloudNukeSession, excludeAfter, configObj, guardDutyDetectors.MaxBatchSize())
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(detectors) > 0 {
-				guardDutyDetectors.detectorIds = detectors
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, guardDutyDetectors)
-			}
-
-		}
-		// End GuardDuty detectors
-
-		// Macie member accounts
-		macieAccounts := MacieMember{}
-		if IsNukeable(macieAccounts.ResourceName(), resourceTypes) {
-			// Unfortunately, the Macie API doesn't provide the metadata information we'd need to implement the excludeAfter or configObj patterns
-			accountIds, err := getAllMacieMemberAccounts(cloudNukeSession)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(accountIds) > 0 {
-				macieAccounts.AccountIds = accountIds
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, macieAccounts)
-			}
-
-		}
-		// End Macie member accounts
-
-		// Start SageMaker Notebook Instances
-		notebookInstances := SageMakerNotebookInstances{}
-		if IsNukeable(notebookInstances.ResourceName(), resourceTypes) {
-			instances, err := getAllNotebookInstances(cloudNukeSession, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(instances) > 0 {
-				notebookInstances.InstanceNames = awsgo.StringValueSlice(instances)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, notebookInstances)
-			}
-		}
-		// End SageMaker Notebook Instances
-
-		// Kinesis Streams
-		kinesisStreams := KinesisStreams{}
-		if IsNukeable(kinesisStreams.ResourceName(), resourceTypes) {
-			streams, err := getAllKinesisStreams(cloudNukeSession, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(streams) > 0 {
-				kinesisStreams.Names = awsgo.StringValueSlice(streams)
-				resourcesInRegion.Resources = append(resourcesInRegion.Resources, kinesisStreams)
-			}
-		}
-		// End Kinesis Streams
-
-		if len(resourcesInRegion.Resources) > 0 {
-			account.Resources[region] = resourcesInRegion
-		}
-		count++
-
-	}
-
-	// Global Resources - These resources are global and do not belong to a specific region
-	// Only process them if the global region was not explicitly excluded
-	if collections.ListContainsElement(targetRegions, GlobalRegion) {
-		logging.Logger.Infof("Checking region [%d/%d]: %s", count, totalRegions, GlobalRegion)
-
-		// As there is no actual region named global we have to pick a valid one just to create the session
-		sessionRegion := defaultRegion
-		session, err := session.NewSession(&awsgo.Config{
-			Region: awsgo.String(sessionRegion),
-		},
-		)
-		if err != nil {
-			return nil, errors.WithStackTrace(err)
-		}
-
-		globalResources := AwsRegionResource{}
-
-		// IAM Users
-		iamUsers := IAMUsers{}
-		if IsNukeable(iamUsers.ResourceName(), resourceTypes) {
-			userNames, err := getAllIamUsers(session, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(userNames) > 0 {
-				iamUsers.UserNames = awsgo.StringValueSlice(userNames)
-				globalResources.Resources = append(globalResources.Resources, iamUsers)
-			}
-		}
-		// End IAM Users
-
-		// IAM OpenID Connect Providers
-		oidcProviders := OIDCProviders{}
-		if IsNukeable(oidcProviders.ResourceName(), resourceTypes) {
-			providerARNs, err := getAllOIDCProviders(session, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-
-			if len(providerARNs) > 0 {
-				oidcProviders.ProviderARNs = awsgo.StringValueSlice(providerARNs)
-				globalResources.Resources = append(globalResources.Resources, oidcProviders)
-			}
-		}
-		// End IAM OpenIDConnectProviders
-
-		// IAM Roles
-		iamRoles := IAMRoles{}
-		if IsNukeable(iamRoles.ResourceName(), resourceTypes) {
-			roleNames, err := getAllIamRoles(session, excludeAfter, configObj)
-			if err != nil {
-				return nil, errors.WithStackTrace(err)
-			}
-			if len(roleNames) > 0 {
-				iamRoles.RoleNames = awsgo.StringValueSlice(roleNames)
-				globalResources.Resources = append(globalResources.Resources, iamRoles)
-			}
-		}
-		// End IAM Roles
-
-		if len(globalResources.Resources) > 0 {
-			account.Resources[GlobalRegion] = globalResources
 		}
 	}
 
-	return &account, nil
+	return &AwsAccountResources{}, nil
 }
 
 // ListResourceTypes - Returns list of resources which can be passed to --resource-type
 func ListResourceTypes() []string {
-	resourceTypes := []string{
-		ACMPCA{}.ResourceName(),
-		ASGroups{}.ResourceName(),
-		LaunchConfigs{}.ResourceName(),
-		LoadBalancers{}.ResourceName(),
-		LoadBalancersV2{}.ResourceName(),
-		SqsQueue{}.ResourceName(),
-		TransitGatewaysVpcAttachment{}.ResourceName(),
-		TransitGatewaysRouteTables{}.ResourceName(),
-		TransitGateways{}.ResourceName(),
-		EC2Instances{}.ResourceName(),
-		EBSVolumes{}.ResourceName(),
-		EIPAddresses{}.ResourceName(),
-		AMIs{}.ResourceName(),
-		Snapshots{}.ResourceName(),
-		ECSClusters{}.ResourceName(),
-		ECSServices{}.ResourceName(),
-		EKSClusters{}.ResourceName(),
-		DBInstances{}.ResourceName(),
-		LambdaFunctions{}.ResourceName(),
-		S3Buckets{}.ResourceName(),
-		IAMUsers{}.ResourceName(),
-		IAMRoles{}.ResourceName(),
-		SecretsManagerSecrets{}.ResourceName(),
-		NatGateways{}.ResourceName(),
-		OpenSearchDomains{}.ResourceName(),
-		CloudWatchDashboards{}.ResourceName(),
-		AccessAnalyzer{}.ResourceName(),
-		DynamoDB{}.ResourceName(),
-		EC2VPCs{}.ResourceName(),
-		Elasticaches{}.ResourceName(),
-		OIDCProviders{}.ResourceName(),
-		KmsCustomerKeys{}.ResourceName(),
-		CloudWatchLogGroups{}.ResourceName(),
-		GuardDuty{}.ResourceName(),
-		MacieMember{}.ResourceName(),
-		SageMakerNotebookInstances{}.ResourceName(),
-		KinesisStreams{}.ResourceName(),
-	}
+	resourceTypes := []string{}
 	sort.Strings(resourceTypes)
 	return resourceTypes
 }
