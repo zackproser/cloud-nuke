@@ -1,3 +1,5 @@
 ResourcesToNuke: 
   - "AWS::Logs::LogGroup"
+  - "AWS::CloudTrail::Trail"
+  - "AWS::EC2::KeyPair"
  

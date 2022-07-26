@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudcontrol"
 	"github.com/gruntwork-io/cloud-nuke/logging"
 	"github.com/gruntwork-io/go-commons/errors"
+	"github.com/hashicorp/go-multierror"
 	"gopkg.in/yaml.v2"
 )
 
@@ -124,42 +126,72 @@ func (a AwsResource) MaxBatchSize() int {
 func (a AwsResource) Nuke(config aws.Config, identifiers []string) error {
 	svc := cloudcontrol.NewFromConfig(config)
 
-	for _, identifier := range identifiers {
-
-		logging.Logger.Infof("Nuking resource type: %s with identifier: %s", a.TypeName, identifier)
-
-		deleteInput := &cloudcontrol.DeleteResourceInput{
-			TypeName:   aws.String(a.TypeName),
-			Identifier: aws.String(identifier),
-		}
-
-		deleteOutput, deleteErr := svc.DeleteResource(context.Background(), deleteInput)
-		if deleteErr != nil {
-			return errors.WithStackTrace(deleteErr)
-		}
-
-		logging.Logger.Infof("Got Nuke output: %+v\n", deleteOutput)
-
-		requestToken := deleteOutput.ProgressEvent.RequestToken
-
-		waiter := cloudcontrol.NewResourceRequestSuccessWaiter(svc)
-
-		waitParams := &cloudcontrol.GetResourceRequestStatusInput{
-			RequestToken: requestToken,
-		}
-
-		maxWaitDur := time.Minute * 10
-
-		logging.Logger.Infof("Waiting on deletion of resource type: %s with identifier: %s", a.TypeName, identifier)
-
-		waitErr := waiter.Wait(context.Background(), waitParams, maxWaitDur)
-		if waitErr != nil {
-			logging.Logger.Infof("Error waiting on deletion for resource type: %s with identifier: %s. Error: %+v\n", a.TypeName, identifier, waitErr)
-			return errors.WithStackTrace(waitErr)
-		}
-		logging.Logger.Infof("Successfully nuked resource of type: %s with identifier: %s", a.TypeName, identifier)
+	if len(identifiers) > a.MaxBatchSize() {
+		logging.Logger.Errorf("Nuking too many resources at once (%d): halting to avoid hitting AWS API rate limiting", len(identifiers))
+		return TooManyResourcesTargetedErr{numTargets: len(identifiers)}
 	}
+
+	logging.Logger.Infof("Nuking resource type (%s) in region (%s)", a.TypeName, config.Region)
+
+	wg := new(sync.WaitGroup)
+	wg.Add(len(identifiers))
+	errChans := make([]chan error, len(identifiers))
+	for i, identifier := range identifiers {
+		errChans[i] = make(chan error, 1)
+		go nukeAsync(wg, errChans[i], svc, a.TypeName, identifier)
+	}
+	wg.Wait()
+
+	var allErrs *multierror.Error
+	for _, errChan := range errChans {
+		if err := <-errChan; err != nil {
+			allErrs = multierror.Append(allErrs, err)
+			logging.Logger.Errorf("[Failed] %s", err)
+		}
+	}
+	finalErr := allErrs.ErrorOrNil()
+	if finalErr != nil {
+		return errors.WithStackTrace(finalErr)
+	}
+
 	return nil
+}
+
+func nukeAsync(wg *sync.WaitGroup, errChan chan error, svc *cloudcontrol.Client, typeName, identifier string) {
+	defer wg.Done()
+
+	logging.Logger.Infof("Nuking resource type: %s with identifier: %s", typeName, identifier)
+
+	deleteInput := &cloudcontrol.DeleteResourceInput{
+		TypeName:   aws.String(typeName),
+		Identifier: aws.String(identifier),
+	}
+
+	deleteOutput, deleteErr := svc.DeleteResource(context.Background(), deleteInput)
+	if deleteErr != nil {
+		errChan <- deleteErr
+		return
+	}
+
+	requestToken := deleteOutput.ProgressEvent.RequestToken
+
+	waiter := cloudcontrol.NewResourceRequestSuccessWaiter(svc)
+
+	waitParams := &cloudcontrol.GetResourceRequestStatusInput{
+		RequestToken: requestToken,
+	}
+
+	// TODO - make this configurable
+	maxWaitDur := time.Minute * 10
+
+	logging.Logger.Infof("Waiting on deletion of resource type: %s with identifier: %s", typeName, identifier)
+
+	waitErr := waiter.Wait(context.Background(), waitParams, maxWaitDur)
+	if waitErr != nil {
+		logging.Logger.Infof("Error waiting on deletion for resource type: %s with identifier: %s. Error: %+v\n", typeName, identifier, waitErr)
+	}
+	logging.Logger.Infof("Successfully nuked resource of type: %s with identifier: %s", typeName, identifier)
+	errChan <- waitErr
 }
 
 type AwsResources interface {
@@ -229,6 +261,14 @@ func (q *Query) Validate() error {
 }
 
 // custom errors
+
+type TooManyResourcesTargetedErr struct {
+	numTargets int
+}
+
+func (err TooManyResourcesTargetedErr) Error() string {
+	return fmt.Sprintf("You have selected too many resources (%d) to nuke at once. Halting to avoid hitting AWS API rate limits", err.numTargets)
+}
 
 type InvalidResourceTypesSuppliedError struct {
 	InvalidTypes []string
