@@ -27,4 +27,8 @@ Found resource (AWSServiceRoleForTrustedAdvisor) of type: {"RoleName":"AWSServic
 Found resource (TestRole) of type: {"RoleName":"TestRole"}
 ```
 
+## Code-diff 
 
+See the current changes here: https://github.com/gruntwork-io/cloud-nuke/compare/master...zackproser:cloud-nuke:master
+
+The potential for simplification (and the possiblility of unlocking all current and future AWS cloudcontrol-compliant resources for free), appears significant. 
