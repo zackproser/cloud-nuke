@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"strings"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudcontrol"
+	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
+	cloudformation_types "github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsgo "github.com/aws/aws-sdk-go/aws"
 	"github.com/gruntwork-io/cloud-nuke/config"
@@ -274,9 +277,42 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 
 // ListResourceTypes - Returns list of resources which can be passed to --resource-type
 func ListResourceTypes() []string {
-	resourceTypes := []string{}
-	sort.Strings(resourceTypes)
-	return resourceTypes
+	logging.Logger.Info("Looking up all supported resource types from CloudControl API...")
+
+	config, loadConfigErr := newConfig("us-east-1")
+	if loadConfigErr != nil {
+		logging.Logger.Errorf("Error loading aws config: %+v\n", loadConfigErr)
+	}
+
+	typeNameStrings := []string{}
+
+	svc := cloudformation.NewFromConfig(config)
+	listTypesInput := &cloudformation.ListTypesInput{
+		DeprecatedStatus: cloudformation_types.DeprecatedStatusLive,
+		Filters: &cloudformation_types.TypeFilters{
+			Category: cloudformation_types.CategoryAwsTypes,
+		},
+		ProvisioningType: cloudformation_types.ProvisioningTypeFullyMutable,
+		Visibility:       cloudformation_types.VisibilityPublic,
+	}
+
+	paginator := cloudformation.NewListTypesPaginator(svc, listTypesInput)
+
+	pageNum := 0
+	for paginator.HasMorePages() {
+		output, err := paginator.NextPage(context.TODO())
+		if err != nil {
+			log.Printf("error: %v", err)
+			return typeNameStrings
+		}
+		for _, typeSummary := range output.TypeSummaries {
+			typeNameStrings = append(typeNameStrings, aws.ToString(typeSummary.TypeName))
+		}
+		pageNum++
+	}
+
+	sort.Strings(typeNameStrings)
+	return typeNameStrings
 }
 
 // IsValidResourceType - Checks if a resourceType is valid or not
