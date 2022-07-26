@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -8,7 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudcontrol"
+	"github.com/gruntwork-io/cloud-nuke/logging"
+	"github.com/gruntwork-io/go-commons/errors"
 	"gopkg.in/yaml.v2"
 )
 
@@ -19,6 +23,10 @@ type AwsAccountResources struct {
 }
 
 type ResourceTypeString string
+
+func (r ResourceTypeString) String() string {
+	return string(r)
+}
 
 type ResourcesToNuke struct {
 	Targets []ResourceTypeString `yaml:"ResourcesToNuke"`
@@ -96,15 +104,72 @@ func (arr AwsRegionResource) IdentifiersForResourceType(resourceType string) []s
 	return []string{}
 }
 
+type AwsResource struct {
+	TypeName    string
+	Identifiers []string
+}
+
+func (a AwsResource) ResourceName() string {
+	return a.TypeName
+}
+
+func (a AwsResource) ResourceIdentifiers() []string {
+	return a.Identifiers
+}
+
+func (a AwsResource) MaxBatchSize() int {
+	return 50
+}
+
+func (a AwsResource) Nuke(config aws.Config, identifiers []string) error {
+	svc := cloudcontrol.NewFromConfig(config)
+
+	for _, identifier := range identifiers {
+
+		logging.Logger.Infof("Nuking resource type: %s with identifier: %s", a.TypeName, identifier)
+
+		deleteInput := &cloudcontrol.DeleteResourceInput{
+			TypeName:   aws.String(a.TypeName),
+			Identifier: aws.String(identifier),
+		}
+
+		deleteOutput, deleteErr := svc.DeleteResource(context.Background(), deleteInput)
+		if deleteErr != nil {
+			return errors.WithStackTrace(deleteErr)
+		}
+
+		logging.Logger.Infof("Got Nuke output: %+v\n", deleteOutput)
+
+		requestToken := deleteOutput.ProgressEvent.RequestToken
+
+		waiter := cloudcontrol.NewResourceRequestSuccessWaiter(svc)
+
+		waitParams := &cloudcontrol.GetResourceRequestStatusInput{
+			RequestToken: requestToken,
+		}
+
+		maxWaitDur := time.Minute * 10
+
+		logging.Logger.Infof("Waiting on deletion of resource type: %s with identifier: %s", a.TypeName, identifier)
+
+		waitErr := waiter.Wait(context.Background(), waitParams, maxWaitDur)
+		if waitErr != nil {
+			logging.Logger.Infof("Error waiting on deletion for resource type: %s with identifier: %s. Error: %+v\n", a.TypeName, identifier, waitErr)
+			return errors.WithStackTrace(waitErr)
+		}
+		logging.Logger.Infof("Successfully nuked resource of type: %s with identifier: %s", a.TypeName, identifier)
+	}
+	return nil
+}
+
 type AwsResources interface {
-	ResourceName() string
+	TypeName() string
 	ResourceIdentifiers() []string
-	MaxBatchSize() int
-	Nuke(session *session.Session, identifiers []string) error
+	Nuke(config aws.Config, identifiers []string) error
 }
 
 type AwsRegionResource struct {
-	Resources []AwsResources
+	Resources []*AwsResource
 }
 
 // Query is a struct that represents the desired parameters for scanning resources within a given account

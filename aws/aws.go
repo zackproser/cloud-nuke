@@ -12,7 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudcontrol"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsgo "github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/gruntwork-io/cloud-nuke/config"
 	"github.com/gruntwork-io/cloud-nuke/externalcreds"
 	"github.com/gruntwork-io/cloud-nuke/logging"
@@ -209,6 +208,10 @@ func GetTargetRegions(enabledRegions []string, selectedRegions []string, exclude
 
 // GetAllResources - Lists all aws resources
 func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTypes []string, configObj config.Config) (*AwsAccountResources, error) {
+	account := AwsAccountResources{
+		Resources: make(map[string]AwsRegionResource),
+	}
+
 	count := 1
 	totalRegions := len(targetRegions)
 
@@ -225,6 +228,8 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 			return nil, configLoadErr
 		}
 
+		resourcesInRegion := AwsRegionResource{}
+
 		svc := cloudcontrol.NewFromConfig(awsConfig)
 
 		resourcesToNuke, loadErr := LoadNukePlan()
@@ -235,21 +240,36 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 		for _, resourceType := range resourcesToNuke.Targets {
 
 			listInput := &cloudcontrol.ListResourcesInput{
-				TypeName: aws.String(string(resourceType)),
+				TypeName: aws.String(resourceType.String()),
 			}
 
 			output, err := svc.ListResources(context.TODO(), listInput)
 			if err != nil {
 				fmt.Printf("Error listing resources: %+v\n", err)
 			}
+
+			resourceIdentifiers := []string{}
+
 			for _, resourceDescription := range output.ResourceDescriptions {
-				fmt.Printf("Found resource (%s) of type: %+v\n", aws.ToString(resourceDescription.Identifier), aws.ToString(resourceDescription.Properties))
+
+				logging.Logger.Infof("Found resource (%s) of type: %+v\n", aws.ToString(resourceDescription.Identifier), aws.ToString(resourceDescription.Properties))
+				resourceIdentifiers = append(resourceIdentifiers, aws.ToString(resourceDescription.Identifier))
 			}
 
+			awsResource := &AwsResource{
+				TypeName:    resourceType.String(),
+				Identifiers: resourceIdentifiers,
+			}
+
+			resourcesInRegion.Resources = append(resourcesInRegion.Resources, awsResource)
+
+		}
+		if len(resourcesInRegion.Resources) > 0 {
+			account.Resources[region] = resourcesInRegion
 		}
 	}
 
-	return &AwsAccountResources{}, nil
+	return &account, nil
 }
 
 // ListResourceTypes - Returns list of resources which can be passed to --resource-type
@@ -274,7 +294,7 @@ func IsNukeable(resourceType string, resourceTypes []string) bool {
 	return false
 }
 
-func nukeAllResourcesInRegion(account *AwsAccountResources, region string, session *session.Session) error {
+func nukeAllResourcesInRegion(account *AwsAccountResources, region string, config aws.Config) error {
 	resourcesInRegion := account.Resources[region]
 
 	for _, resources := range resourcesInRegion.Resources {
@@ -286,7 +306,7 @@ func nukeAllResourcesInRegion(account *AwsAccountResources, region string, sessi
 
 		for i := 0; i < len(batches); i++ {
 			batch := batches[i]
-			if err := resources.Nuke(session, batch); err != nil {
+			if err := resources.Nuke(config, batch); err != nil {
 				// TODO: Figure out actual error type
 				if strings.Contains(err.Error(), "RequestLimitExceeded") {
 					logging.Logger.Info("Request limit reached. Waiting 1 minute before making new requests")
@@ -311,22 +331,19 @@ func nukeAllResourcesInRegion(account *AwsAccountResources, region string, sessi
 func NukeAllResources(account *AwsAccountResources, regions []string) error {
 	for _, region := range regions {
 		// region that will be used to create a session
-		sessionRegion := region
+		targetRegion := region
 
 		// As there is no actual region named global we have to pick a valid one just to create the session
 		if region == GlobalRegion {
-			sessionRegion = defaultRegion
+			targetRegion = defaultRegion
 		}
 
-		session, err := session.NewSession(&awsgo.Config{
-			Region: awsgo.String(sessionRegion),
-		},
-		)
+		config, err := newConfig(targetRegion)
 		if err != nil {
 			return errors.WithStackTrace(err)
 		}
 
-		err = nukeAllResourcesInRegion(account, region, session)
+		err = nukeAllResourcesInRegion(account, region, config)
 
 		if err != nil {
 			return errors.WithStackTrace(err)

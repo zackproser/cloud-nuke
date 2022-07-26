@@ -1,4 +1,3 @@
 ResourcesToNuke: 
   - "AWS::Logs::LogGroup"
-  - "AWS::IAM::Role"
  
