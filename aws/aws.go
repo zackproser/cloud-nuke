@@ -235,15 +235,16 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 
 		svc := cloudcontrol.NewFromConfig(awsConfig)
 
-		resourcesToNuke, loadErr := LoadNukePlan()
+		// TODO - move me to the right place
+		/*resourcesToNuke, loadErr := LoadNukePlan()
 		if loadErr != nil {
 			return nil, loadErr
-		}
+		}*/
 
-		for _, resourceType := range resourcesToNuke.Targets {
+		for _, resourceType := range resourceTypes {
 
 			listInput := &cloudcontrol.ListResourcesInput{
-				TypeName: aws.String(resourceType.String()),
+				TypeName: aws.String(resourceType),
 			}
 
 			output, err := svc.ListResources(context.TODO(), listInput)
@@ -260,7 +261,7 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 			}
 
 			awsResource := &AwsResource{
-				TypeName:    resourceType.String(),
+				TypeName:    resourceType,
 				Identifiers: resourceIdentifiers,
 			}
 
