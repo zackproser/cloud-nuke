@@ -242,7 +242,6 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 		}*/
 
 		for _, resourceType := range resourceTypes {
-
 			listInput := &cloudcontrol.ListResourcesInput{
 				TypeName: aws.String(resourceType),
 			}
@@ -255,8 +254,7 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 			resourceIdentifiers := []string{}
 
 			for _, resourceDescription := range output.ResourceDescriptions {
-
-				logging.Logger.Infof("Found resource (%s) of type: %+v\n", aws.ToString(resourceDescription.Identifier), aws.ToString(resourceDescription.Properties))
+				logging.Logger.Infof("Found resource (%s) with properties: %+v\n", aws.ToString(resourceDescription.Identifier), aws.ToString(resourceDescription.Properties))
 				resourceIdentifiers = append(resourceIdentifiers, aws.ToString(resourceDescription.Identifier))
 			}
 
@@ -266,8 +264,8 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 			}
 
 			resourcesInRegion.Resources = append(resourcesInRegion.Resources, awsResource)
-
 		}
+
 		if len(resourcesInRegion.Resources) > 0 {
 			account.Resources[region] = resourcesInRegion
 		}

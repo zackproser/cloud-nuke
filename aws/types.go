@@ -15,6 +15,7 @@ import (
 	"github.com/gruntwork-io/cloud-nuke/logging"
 	"github.com/gruntwork-io/go-commons/errors"
 	"github.com/hashicorp/go-multierror"
+	"github.com/pterm/pterm"
 	"gopkg.in/yaml.v2"
 )
 
@@ -123,6 +124,13 @@ func (a AwsResource) MaxBatchSize() int {
 	return 50
 }
 
+type AwsResourceResult struct {
+	Identifier      string
+	OperationStatus string
+	StatusMessage   string
+	Error           error
+}
+
 func (a AwsResource) Nuke(config aws.Config, identifiers []string) error {
 	svc := cloudcontrol.NewFromConfig(config)
 
@@ -131,24 +139,42 @@ func (a AwsResource) Nuke(config aws.Config, identifiers []string) error {
 		return TooManyResourcesTargetedErr{numTargets: len(identifiers)}
 	}
 
+	resultsMap := make(map[string]AwsResourceResult)
+
 	logging.Logger.Infof("Nuking resource type (%s) in region (%s)", a.TypeName, config.Region)
 
 	wg := new(sync.WaitGroup)
 	wg.Add(len(identifiers))
-	errChans := make([]chan error, len(identifiers))
+	resultChans := make([]chan AwsResourceResult, len(identifiers))
 	for i, identifier := range identifiers {
-		errChans[i] = make(chan error, 1)
-		go nukeAsync(wg, errChans[i], svc, a.TypeName, identifier)
+		resultChans[i] = make(chan AwsResourceResult, 1)
+		go nukeAsync(wg, resultChans[i], svc, a.TypeName, identifier)
 	}
 	wg.Wait()
 
 	var allErrs *multierror.Error
-	for _, errChan := range errChans {
-		if err := <-errChan; err != nil {
-			allErrs = multierror.Append(allErrs, err)
-			logging.Logger.Errorf("[Failed] %s", err)
+	for _, resultChan := range resultChans {
+		result := <-resultChan
+		// Update resultsMap with an entry for the Identifier and its result (error or nil)
+		resultsMap[result.Identifier] = result
+		if result.Error != nil {
+			allErrs = multierror.Append(allErrs, result.Error)
 		}
 	}
+
+	tableData := pterm.TableData{
+		{"Resource Identifier", "OperationStatus", "StatusMessage", "Error"},
+	}
+
+	// Display results table
+	for identifier, result := range resultsMap {
+		tableData = append(tableData, []string{identifier, result.OperationStatus, result.StatusMessage, result.Error.Error()})
+	}
+
+	pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
+
+	pterm.Println()
+
 	finalErr := allErrs.ErrorOrNil()
 	if finalErr != nil {
 		return errors.WithStackTrace(finalErr)
@@ -157,8 +183,13 @@ func (a AwsResource) Nuke(config aws.Config, identifiers []string) error {
 	return nil
 }
 
-func nukeAsync(wg *sync.WaitGroup, errChan chan error, svc *cloudcontrol.Client, typeName, identifier string) {
+func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloudcontrol.Client, typeName, identifier string) {
 	defer wg.Done()
+
+	awsResourceResult := AwsResourceResult{
+		Identifier: identifier,
+		Error:      nil,
+	}
 
 	logging.Logger.Infof("Nuking resource type: %s with identifier: %s", typeName, identifier)
 
@@ -169,7 +200,9 @@ func nukeAsync(wg *sync.WaitGroup, errChan chan error, svc *cloudcontrol.Client,
 
 	deleteOutput, deleteErr := svc.DeleteResource(context.Background(), deleteInput)
 	if deleteErr != nil {
-		errChan <- deleteErr
+		awsResourceResult.Error = deleteErr
+
+		resultChan <- awsResourceResult
 		return
 	}
 
@@ -186,12 +219,24 @@ func nukeAsync(wg *sync.WaitGroup, errChan chan error, svc *cloudcontrol.Client,
 
 	logging.Logger.Infof("Waiting on deletion of resource type: %s with identifier: %s", typeName, identifier)
 
-	waitErr := waiter.Wait(context.Background(), waitParams, maxWaitDur)
-	if waitErr != nil {
-		logging.Logger.Infof("Error waiting on deletion for resource type: %s with identifier: %s. Error: %+v\n", typeName, identifier, waitErr)
+	statusOutput, waitErr := waiter.WaitForOutput(context.TODO(), waitParams, maxWaitDur)
+
+	if statusOutput != nil {
+
+		logging.Logger.Infof("DEBUG: statusOutput: %+v\n", statusOutput)
+		logging.Logger.Infof("DEBUG: statusOutput.ProgressEvent: %+v\n", statusOutput.ProgressEvent)
+
+		awsResourceResult.OperationStatus = string(statusOutput.ProgressEvent.OperationStatus)
+		awsResourceResult.StatusMessage = string(aws.ToString(statusOutput.ProgressEvent.StatusMessage))
+	} else {
+		// Backfill statusOutput with user-friendly status message
+		defaultMsg := "Not Available"
+
+		awsResourceResult.OperationStatus = defaultMsg
+		awsResourceResult.StatusMessage = defaultMsg
 	}
-	logging.Logger.Infof("Successfully nuked resource of type: %s with identifier: %s", typeName, identifier)
-	errChan <- waitErr
+	awsResourceResult.Error = waitErr
+	resultChan <- awsResourceResult
 }
 
 type AwsResources interface {

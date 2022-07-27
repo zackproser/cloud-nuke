@@ -13,6 +13,7 @@ require (
 	github.com/golang/mock v1.6.0
 	github.com/gruntwork-io/go-commons v0.8.2
 	github.com/hashicorp/go-multierror v1.1.0
+	github.com/pterm/pterm v0.12.45
 	github.com/sirupsen/logrus v1.6.0
 	github.com/stretchr/testify v1.7.1
 	github.com/urfave/cli v1.22.4
