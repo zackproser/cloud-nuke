@@ -125,6 +125,7 @@ func (a AwsResource) MaxBatchSize() int {
 }
 
 type AwsResourceResult struct {
+	TypeName        string
 	Identifier      string
 	Operation       string
 	OperationStatus string
@@ -173,7 +174,13 @@ func (a AwsResource) Nuke(config aws.Config, identifiers []string) (pterm.TableD
 		} else {
 			errResult = "nil"
 		}
-		tableData = append(tableData, []string{identifier, result.OperationStatus, result.StatusMessage, errResult})
+		tableData = append(tableData, []string{
+			colorTypeAndIdentifier(result.TypeName, identifier),
+			result.Operation,
+			colorOperationStatus(result.OperationStatus),
+			result.StatusMessage,
+			errResult,
+		})
 	}
 
 	finalErr := allErrs.ErrorOrNil()
@@ -184,10 +191,22 @@ func (a AwsResource) Nuke(config aws.Config, identifiers []string) (pterm.TableD
 	return tableData, nil
 }
 
+func colorTypeAndIdentifier(typeName, identifier string) string {
+	return fmt.Sprintf("%s - %s", pterm.LightMagenta(typeName), pterm.Blue(identifier))
+}
+
+func colorOperationStatus(s string) string {
+	if s == "SUCCESS" {
+		return pterm.Green(s)
+	}
+	return pterm.Red(s)
+}
+
 func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloudcontrol.Client, typeName, identifier string) {
 	defer wg.Done()
 
 	awsResourceResult := AwsResourceResult{
+		TypeName:   typeName,
 		Identifier: identifier,
 		Error:      nil,
 	}
@@ -218,7 +237,7 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 	// TODO - make this configurable
 	maxWaitDur := time.Minute * 10
 
-	logging.Logger.Infof("Waiting on deletion of resource type: %s with identifier: %s", typeName, identifier)
+	logging.Logger.Debugf("Waiting on deletion of resource type: %s with identifier: %s", typeName, identifier)
 
 	_, waitErr := waiter.WaitForOutput(context.TODO(), waitParams, maxWaitDur)
 	if waitErr != nil {
@@ -229,12 +248,12 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 
 	if statusOutput != nil {
 
-		logging.Logger.Infof("DEBUG: statusOutput: %+v\n", statusOutput)
-		logging.Logger.Infof("DEBUG: statusOutput.ProgressEvent: %+v\n", statusOutput.ProgressEvent)
+		logging.Logger.Debugf("DEBUG: statusOutput: %+v\n", statusOutput)
+		logging.Logger.Debugf("DEBUG: statusOutput.ProgressEvent: %+v\n", statusOutput.ProgressEvent)
 
-		awsResourceResult.Operation = string(statusOutput.ProgressEvent.Operation)
-		awsResourceResult.OperationStatus = string(statusOutput.ProgressEvent.OperationStatus)
-		awsResourceResult.StatusMessage = string(aws.ToString(statusOutput.ProgressEvent.StatusMessage))
+		awsResourceResult.Operation = truncateText(string(statusOutput.ProgressEvent.Operation), 25)
+		awsResourceResult.OperationStatus = truncateText(string(statusOutput.ProgressEvent.OperationStatus), 25)
+		awsResourceResult.StatusMessage = truncateText(string(aws.ToString(statusOutput.ProgressEvent.StatusMessage)), 25)
 	} else {
 		// Backfill statusOutput with user-friendly status message
 		defaultMsg := "Not Available"
@@ -244,6 +263,13 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 	}
 	awsResourceResult.Error = getStatusErr
 	resultChan <- awsResourceResult
+}
+
+func truncateText(s string, max int) string {
+	if len(s) < max {
+		return s
+	}
+	return s[:max]
 }
 
 type AwsResources interface {

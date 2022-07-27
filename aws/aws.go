@@ -255,7 +255,7 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 			resourceIdentifiers := []string{}
 
 			for _, resourceDescription := range output.ResourceDescriptions {
-				logging.Logger.Infof("Found resource (%s) with properties: %+v\n", aws.ToString(resourceDescription.Identifier), aws.ToString(resourceDescription.Properties))
+				logging.Logger.Debugf("Found resource (%s) with properties: %+v\n", aws.ToString(resourceDescription.Identifier), aws.ToString(resourceDescription.Properties))
 				resourceIdentifiers = append(resourceIdentifiers, aws.ToString(resourceDescription.Identifier))
 			}
 
@@ -270,6 +270,8 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 		if len(resourcesInRegion.Resources) > 0 {
 			account.Resources[region] = resourcesInRegion
 		}
+		count++
+
 	}
 
 	return &account, nil
@@ -277,8 +279,6 @@ func GetAllResources(targetRegions []string, excludeAfter time.Time, resourceTyp
 
 // ListResourceTypes - Returns list of resources which can be passed to --resource-type
 func ListResourceTypes() []string {
-	logging.Logger.Info("Looking up all supported resource types from CloudControl API...")
-
 	config, loadConfigErr := newConfig("us-east-1")
 	if loadConfigErr != nil {
 		logging.Logger.Errorf("Error loading aws config: %+v\n", loadConfigErr)
@@ -334,7 +334,7 @@ func nukeAllResourcesInRegion(account *AwsAccountResources, region string, confi
 	resourcesInRegion := account.Resources[region]
 
 	tableData := make([][]string, 1)
-	tableData = append(tableData, []string{"Resource Identifier", "Operation", "OperationStatus", "StatusMessage", "Error"})
+	tableData = append(tableData, []string{"Resource", "Operation", "Status", "StatusMessage", "Error"})
 
 	for _, resources := range resourcesInRegion.Resources {
 		length := len(resources.ResourceIdentifiers())
@@ -368,16 +368,20 @@ func nukeAllResourcesInRegion(account *AwsAccountResources, region string, confi
 		}
 	}
 
-	pterm.Println()
+	// Print regional results
+	if len(resourcesInRegion.Resources) > 0 {
+		pterm.Println()
 
-	renderSection(fmt.Sprintf("Region: %s", region))
+		renderSection(fmt.Sprintf("Region: %s", region))
 
-	pterm.DefaultTable.
-		WithHasHeader().
-		WithData(tableData).
-		Render()
+		pterm.DefaultTable.
+			WithHasHeader().
+			WithData(tableData).
+			Render()
 
-	pterm.Println()
+		pterm.Println()
+
+	}
 
 	return nil
 }
