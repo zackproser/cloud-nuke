@@ -20,6 +20,7 @@ import (
 	"github.com/gruntwork-io/cloud-nuke/logging"
 	"github.com/gruntwork-io/go-commons/collections"
 	"github.com/gruntwork-io/go-commons/errors"
+	"github.com/pterm/pterm"
 )
 
 // OptInNotRequiredRegions contains all regions that are enabled by default on new AWS accounts
@@ -332,6 +333,9 @@ func IsNukeable(resourceType string, resourceTypes []string) bool {
 func nukeAllResourcesInRegion(account *AwsAccountResources, region string, config aws.Config) error {
 	resourcesInRegion := account.Resources[region]
 
+	tableData := make([][]string, 1)
+	tableData = append(tableData, []string{"Resource Identifier", "Operation", "OperationStatus", "StatusMessage", "Error"})
+
 	for _, resources := range resourcesInRegion.Resources {
 		length := len(resources.ResourceIdentifiers())
 
@@ -341,7 +345,8 @@ func nukeAllResourcesInRegion(account *AwsAccountResources, region string, confi
 
 		for i := 0; i < len(batches); i++ {
 			batch := batches[i]
-			if err := resources.Nuke(config, batch); err != nil {
+			returnedTableData, err := resources.Nuke(config, batch)
+			if err != nil {
 				// TODO: Figure out actual error type
 				if strings.Contains(err.Error(), "RequestLimitExceeded") {
 					logging.Logger.Info("Request limit reached. Waiting 1 minute before making new requests")
@@ -352,6 +357,10 @@ func nukeAllResourcesInRegion(account *AwsAccountResources, region string, confi
 				return errors.WithStackTrace(err)
 			}
 
+			for _, row := range returnedTableData {
+				tableData = append(tableData, row)
+			}
+
 			if i != len(batches)-1 {
 				logging.Logger.Info("Sleeping for 10 seconds before processing next batch...")
 				time.Sleep(10 * time.Second)
@@ -359,7 +368,23 @@ func nukeAllResourcesInRegion(account *AwsAccountResources, region string, confi
 		}
 	}
 
+	pterm.Println()
+
+	renderSection(fmt.Sprintf("Region: %s", region))
+
+	pterm.DefaultTable.
+		WithHasHeader().
+		WithData(tableData).
+		Render()
+
+	pterm.Println()
+
 	return nil
+}
+
+func renderSection(sectionTitle string) {
+	pterm.DefaultSection.Style = pterm.NewStyle(pterm.FgLightCyan)
+	pterm.DefaultSection.WithLevel(0).Println(sectionTitle)
 }
 
 // NukeAllResources - Nukes all aws resources

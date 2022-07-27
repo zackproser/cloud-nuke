@@ -126,17 +126,20 @@ func (a AwsResource) MaxBatchSize() int {
 
 type AwsResourceResult struct {
 	Identifier      string
+	Operation       string
 	OperationStatus string
 	StatusMessage   string
 	Error           error
 }
 
-func (a AwsResource) Nuke(config aws.Config, identifiers []string) error {
+func (a AwsResource) Nuke(config aws.Config, identifiers []string) (pterm.TableData, error) {
 	svc := cloudcontrol.NewFromConfig(config)
+
+	tableData := make([][]string, 1)
 
 	if len(identifiers) > a.MaxBatchSize() {
 		logging.Logger.Errorf("Nuking too many resources at once (%d): halting to avoid hitting AWS API rate limiting", len(identifiers))
-		return TooManyResourcesTargetedErr{numTargets: len(identifiers)}
+		return tableData, TooManyResourcesTargetedErr{numTargets: len(identifiers)}
 	}
 
 	resultsMap := make(map[string]AwsResourceResult)
@@ -162,25 +165,23 @@ func (a AwsResource) Nuke(config aws.Config, identifiers []string) error {
 		}
 	}
 
-	tableData := pterm.TableData{
-		{"Resource Identifier", "OperationStatus", "StatusMessage", "Error"},
-	}
-
 	// Display results table
 	for identifier, result := range resultsMap {
-		tableData = append(tableData, []string{identifier, result.OperationStatus, result.StatusMessage, result.Error.Error()})
+		var errResult string
+		if result.Error != nil {
+			errResult = result.Error.Error()
+		} else {
+			errResult = "nil"
+		}
+		tableData = append(tableData, []string{identifier, result.OperationStatus, result.StatusMessage, errResult})
 	}
-
-	pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
-
-	pterm.Println()
 
 	finalErr := allErrs.ErrorOrNil()
 	if finalErr != nil {
-		return errors.WithStackTrace(finalErr)
+		return tableData, errors.WithStackTrace(finalErr)
 	}
 
-	return nil
+	return tableData, nil
 }
 
 func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloudcontrol.Client, typeName, identifier string) {
@@ -219,13 +220,19 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 
 	logging.Logger.Infof("Waiting on deletion of resource type: %s with identifier: %s", typeName, identifier)
 
-	statusOutput, waitErr := waiter.WaitForOutput(context.TODO(), waitParams, maxWaitDur)
+	_, waitErr := waiter.WaitForOutput(context.TODO(), waitParams, maxWaitDur)
+	if waitErr != nil {
+		fmt.Errorf("Error waiting on output: %+v\n", waitErr)
+	}
+
+	statusOutput, getStatusErr := svc.GetResourceRequestStatus(context.TODO(), waitParams)
 
 	if statusOutput != nil {
 
 		logging.Logger.Infof("DEBUG: statusOutput: %+v\n", statusOutput)
 		logging.Logger.Infof("DEBUG: statusOutput.ProgressEvent: %+v\n", statusOutput.ProgressEvent)
 
+		awsResourceResult.Operation = string(statusOutput.ProgressEvent.Operation)
 		awsResourceResult.OperationStatus = string(statusOutput.ProgressEvent.OperationStatus)
 		awsResourceResult.StatusMessage = string(aws.ToString(statusOutput.ProgressEvent.StatusMessage))
 	} else {
@@ -235,7 +242,7 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 		awsResourceResult.OperationStatus = defaultMsg
 		awsResourceResult.StatusMessage = defaultMsg
 	}
-	awsResourceResult.Error = waitErr
+	awsResourceResult.Error = getStatusErr
 	resultChan <- awsResourceResult
 }
 
