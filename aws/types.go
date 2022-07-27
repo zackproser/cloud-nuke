@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudcontrol"
+	"github.com/aws/aws-sdk-go-v2/service/cloudcontrol/types"
 	"github.com/gruntwork-io/cloud-nuke/logging"
 	"github.com/gruntwork-io/go-commons/errors"
 	"github.com/hashicorp/go-multierror"
@@ -228,7 +229,9 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 
 	requestToken := deleteOutput.ProgressEvent.RequestToken
 
-	waiter := cloudcontrol.NewResourceRequestSuccessWaiter(svc)
+	waiter := cloudcontrol.NewResourceRequestSuccessWaiter(svc, func(o *cloudcontrol.ResourceRequestSuccessWaiterOptions) {
+		o.Retryable = RetryGetResourceRequestStatus(nil)
+	})
 
 	waitParams := &cloudcontrol.GetResourceRequestStatusInput{
 		RequestToken: requestToken,
@@ -253,7 +256,7 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 
 		awsResourceResult.Operation = truncateText(string(statusOutput.ProgressEvent.Operation), 25)
 		awsResourceResult.OperationStatus = truncateText(string(statusOutput.ProgressEvent.OperationStatus), 25)
-		awsResourceResult.StatusMessage = truncateText(string(aws.ToString(statusOutput.ProgressEvent.StatusMessage)), 25)
+		awsResourceResult.StatusMessage = truncateText(string(aws.ToString(statusOutput.ProgressEvent.StatusMessage)), 60)
 	} else {
 		// Backfill statusOutput with user-friendly status message
 		defaultMsg := "Not Available"
@@ -263,6 +266,32 @@ func nukeAsync(wg *sync.WaitGroup, resultChan chan AwsResourceResult, svc *cloud
 	}
 	awsResourceResult.Error = getStatusErr
 	resultChan <- awsResourceResult
+}
+
+func RetryGetResourceRequestStatus(pProgressEvent **types.ProgressEvent) func(context.Context, *cloudcontrol.GetResourceRequestStatusInput, *cloudcontrol.GetResourceRequestStatusOutput, error) (bool, error) {
+	return func(ctx context.Context, input *cloudcontrol.GetResourceRequestStatusInput, output *cloudcontrol.GetResourceRequestStatusOutput, err error) (bool, error) {
+		if err == nil {
+			progressEvent := output.ProgressEvent
+			if pProgressEvent != nil {
+				*pProgressEvent = progressEvent
+			}
+
+			switch value := progressEvent.OperationStatus; value {
+			case types.OperationStatusSuccess, types.OperationStatusCancelComplete:
+				return false, nil
+
+			case types.OperationStatusFailed:
+				if progressEvent.ErrorCode == types.HandlerErrorCodeNotFound && progressEvent.Operation == types.OperationDelete {
+					// Resource not found error on delete is OK.
+					return false, nil
+				}
+
+				return false, fmt.Errorf("waiter state transitioned to %s. StatusMessage: %s. ErrorCode: %s", value, aws.ToString(progressEvent.StatusMessage), progressEvent.ErrorCode)
+			}
+		}
+
+		return true, err
+	}
 }
 
 func truncateText(s string, max int) string {
